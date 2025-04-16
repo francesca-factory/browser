@@ -401,34 +401,50 @@ pub const Page = struct {
 
         log.info("GET {any} {d}", .{ url, header.status });
 
-        const ct = blk: {
-            break :blk header.get("content-type") orelse {
-                // no content type in HTTP headers.
-                // TODO try to sniff mime type from the body.
-                log.info("no content-type HTTP header", .{});
+        // Determine the content type using both HTTP headers and content sniffing
+        var content_buffer = std.ArrayList(u8).init(arena);
+        defer content_buffer.deinit();
 
-                // Assume it's HTML for now.
-                break :blk "text/html; charset=utf-8";
-            };
-        };
+        // Collect the response body for MIME sniffing
+        while (try response.next()) |data| {
+            try content_buffer.appendSlice(data);
+        }
+        
+        // Save the body content for later use
+        const body_content = try content_buffer.toOwnedSlice();
 
-        log.debug("header content-type: {s}", .{ct});
-        var mime = try Mime.parse(arena, ct);
+        // Determine the content type
+        const mime = try determineContentType(arena, header, body_content);
         defer mime.deinit();
 
+        log.debug("determined content-type: {s}", .{try mime.toString(arena)});
+
         if (mime.isHTML()) {
-            try self.loadHTMLDoc(&response, mime.charset orelse "utf-8", aux_data);
+            try self.loadHTMLDoc(body_content, mime.charset orelse "utf-8", aux_data);
         } else {
-            log.info("non-HTML document: {s}", .{ct});
-            var arr: std.ArrayListUnmanaged(u8) = .{};
-            while (try response.next()) |data| {
-                try arr.appendSlice(arena, try arena.dupe(u8, data));
-            }
-            // save the body into the page.
-            self.raw_data = arr.items;
+            log.info("non-HTML document: {s}", .{try mime.toString(arena)});
+            // Save the raw data into the page
+            self.raw_data = body_content;
         }
 
         session.notify(&.{ .page_navigated = .{ .url = url, .timestamp = timestamp() } });
+    }
+
+    // Helper function to determine content type from HTTP headers and content sniffing
+    fn determineContentType(allocator: Allocator, header: http.Response.ResponseHeader, content: []const u8) !Mime {
+        // First check if we have a Content-Type header
+        if (header.get("content-type")) |ct| {
+            // Parse the content type from the header
+            return Mime.parse(allocator, ct) catch |err| {
+                log.warn("Invalid content-type header: {s}, error: {any}", .{ ct, err });
+                // If header parsing fails, fall back to sniffing
+                return Mime.fromBytes(allocator, content);
+            };
+        }
+
+        // No Content-Type header, use content sniffing
+        log.info("No content-type HTTP header, using MIME sniffing", .{});
+        return Mime.fromBytes(allocator, content);
     }
 
     pub const ClickResult = union(enum) {
@@ -465,7 +481,7 @@ pub const Page = struct {
     }
 
     // https://html.spec.whatwg.org/#read-html
-    fn loadHTMLDoc(self: *Page, reader: anytype, charset: []const u8, aux_data: ?[]const u8) !void {
+    fn loadHTMLDoc(self: *Page, content: []const u8, charset: []const u8, aux_data: ?[]const u8) !void {
         const arena = self.arena;
 
         // start netsurf memory arena.
@@ -475,7 +491,9 @@ pub const Page = struct {
 
         const ccharset = try arena.dupeZ(u8, charset);
 
-        const html_doc = try parser.documentHTMLParse(reader, ccharset);
+        // Create a reader from the content
+        var content_reader = ContentReader{ .content = content };
+        const html_doc = try parser.documentHTMLParse(&content_reader, ccharset);
         const doc = parser.documentHTMLToDocument(html_doc);
 
         // save a document's pointer in the page.
@@ -608,6 +626,26 @@ pub const Page = struct {
             loadevt,
         );
     }
+
+    // A reader that reads from a memory buffer
+    const ContentReader = struct {
+        content: []const u8,
+        position: usize = 0,
+
+        pub fn next(self: *ContentReader) !?[]u8 {
+            if (self.position >= self.content.len) {
+                return null;
+            }
+            
+            const remaining = self.content.len - self.position;
+            const chunk_size = std.math.min(remaining, 4096); // Use a reasonable chunk size
+            
+            const result = self.content[self.position..self.position + chunk_size];
+            self.position += chunk_size;
+            
+            return @constCast(result);
+        }
+    };
 
     // evalScript evaluates the src in priority.
     // if no src is present, we evaluate the text source.
